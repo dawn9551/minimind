@@ -2,3 +2,16 @@ model/__pycache__
 out
 website/
 docs-minimind/
+
+# 忽略权重文件
+checkpoints/
+*.pth
+*.bin
+
+# 忽略大数据集（如果文件超过 100MB）
+dataset/*.jsonl
+dataset/__pycache__/
+
+# 忽略 Python 缓存和测试文件
+**/__pycache__/
+test/
