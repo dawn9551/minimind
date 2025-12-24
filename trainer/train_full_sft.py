@@ -107,22 +107,28 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", help="wandb项目名")
     args = parser.parse_args()
 
-    # ========== 1. 初始化环境和随机种子 ==========
-    local_rank = init_distributed_mode()
+    # ========== 1. 初始化分布式环境和随机种子 ==========
+    local_rank = init_distributed_mode()  ## 初始化分布式，返回本地rank
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
-    setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
+    setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))  ## 设置随机种子
     
-    # ========== 2. 配置目录、模型参数、检查ckp ==========
-    os.makedirs(args.save_dir, exist_ok=True)
+    # ========== 2. 配置目录、模型参数、检查点 ==========
+    os.makedirs(args.save_dir, exist_ok=True)  ## 创建保存目录
+    ## 创建模型配置
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    ## 检查是否存在可恢复的检查点（断点续训功能）
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
+    ## 配置自动混合精度（AMP）的数据类型
+    ## 创建autocast上下文管理器（加速训练、节省显存）
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
-    # ========== 4. 配wandb ==========
+    # ========== 4. 配wandb日志系统 ==========
+    ## 仅在主进程初始化日志系统
+    ## 支持断点续训时恢复日志记录
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
@@ -131,14 +137,23 @@ if __name__ == "__main__":
         wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
-    # ========== 5. 定义模型、数据、优化器 ==========
+    # ========== 5. 定义模型、数据集、优化器 ==========
+    ## 初始化模型
+    ## 创建SFT数据集（指令微调格式）
+    ## 创建分布式采样器（确保数据不重复）
+    ## 创建梯度缩放器（混合精度训练必需）
+    ## 创建AdamW优化器
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
-    # ========== 6. 从ckp恢复状态 ==========
+    # ========== 6. 从检查点恢复状态 ==========
+    ## 如果存在检查点，恢复模型权重
+    ## 恢复优化器状态（学习率、动量等）
+    ## 恢复混合精度训练状态
+    ## 恢复训练进度（epoch、step）
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
@@ -147,12 +162,18 @@ if __name__ == "__main__":
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
     
-    # ========== 7. DDP包模型 ==========
+    # ========== 7. DDP包模型；分布式数据并行包装 ==========
+    ## 使用DDP包装模型（多GPU训练核心）
+    ## 忽略旋转位置编码参数（RoPE、无需同步）
     if dist.is_initialized():
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
     # ========== 8. 开始训练 ==========
+    ## 遍历每个epoch
+    ## 设置采样器epoch（确保每个epoch的shuffle不同）
+    ## 断点续训时跳过已经训练的batch
+    ## 调用train_epoch()执行具体训练逻辑
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         if epoch == start_epoch and start_step > 0: # 第一个epoch且存在检查点

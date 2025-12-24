@@ -27,11 +27,16 @@ def get_lr(current_step, total_steps, lr):
 
 
 def init_distributed_mode():
+    # 使用torchrun启动会自动设置RANK和LOCAL_RANK环境变量
+    # 如果未使用torchrun启动，例如：python train_full_sft.py 则获取不到RANK环境变量返回 -1
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
 
+    # 初始化进程组
     dist.init_process_group(backend="nccl")
+    # 设置本地设备
     local_rank = int(os.environ["LOCAL_RANK"])
+    # 一个进程绑定一个GPU
     torch.cuda.set_device(local_rank)
     return local_rank
 
@@ -53,7 +58,11 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
     if model is not None:
         from torch.nn.parallel import DistributedDataParallel
+        # 提取模型权重
         state_dict = model.module.state_dict() if isinstance(model, DistributedDataParallel) else model.state_dict()
+        # 权重转换与保存
+        ## v.half(): 转换为FP16
+        ## v.half().cpu(): 释放GPU显存
         state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
         ckp_tmp = ckp_path + '.tmp'
         torch.save(state_dict, ckp_tmp)
@@ -66,6 +75,7 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
             else:
                 wandb_id = getattr(wandb, 'id', None)
 
+        # 构建完整的训练状态
         resume_data = {
             'model': state_dict,
             'optimizer': optimizer.state_dict(),
@@ -103,9 +113,13 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
 
 
 def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
+    # 加载分词器
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+
+    # 创建模型实例
     model = MiniMindForCausalLM(lm_config)
 
+    # 加载预训练参数
     if from_weight!= 'none':
         moe_suffix = '_moe' if lm_config.use_moe else ''
         weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
