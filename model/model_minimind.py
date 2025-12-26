@@ -130,8 +130,12 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     def rotate_half(x):
+        # 1. z[..., z.shape[-1] // 2:] -> [x0​,…,x31​, y0​,…,y31​]: X表示实部，y表示虚部
+        # 2. -x[..., :32] = -y;   x[..., 32:] = x
+        # 3. rotate_half([x, y]) -> [-y, x]
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
 
+    # rotate_half([x, y]) -> [-y, x]
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
@@ -150,19 +154,34 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 class Attention(nn.Module):
     def __init__(self, args: MiniMindConfig):
         super().__init__()
+        # group query attention 配置
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        # Q头数必须是 key,value头数的整数倍
         assert args.num_attention_heads % self.num_key_value_heads == 0
+        # Q头数
         self.n_local_heads = args.num_attention_heads
+        # k v头数
         self.n_local_kv_heads = self.num_key_value_heads
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        # 每个头的维度
         self.head_dim = args.hidden_size // args.num_attention_heads
+        # q,k,v 投影层
+        ## 512 -> 512 (8 * 64)
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        ## 512 -> 128 (2 * 64)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        ## 512 -> 128 (2 * 64)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+
+        # 输出投影层
         self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+
+        # dropout
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
+
+        # flash attention
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
@@ -172,12 +191,20 @@ class Attention(nn.Module):
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
-        bsz, seq_len, _ = x.shape
+        bsz, seq_len, _ = x.shape  # [batch_size, sequence_length, 512]
+        # xq: [batch_size, sequence_length, 512]
+        # xk: [batch_size, sequence_length, 128]
+        # xv: [batch_size, sequence_length, 128]
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+
+        # xq: [batch_size, sequence_length, 512] -> [batch_size, sequence_length, 8, 64]
+        # xk: [batch_size, sequence_length, 128] -> [batch_size, sequence_length, 2, 64]
+        # xv: [batch_size, sequence_length, 128] -> [batch_size, sequence_length, 2, 64]
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
+        # 旋转位置编码
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
@@ -353,8 +380,10 @@ class MOEFeedForward(nn.Module):
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
+        # Q的注意力头数
         self.num_attention_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size
+        # head_dim: 64
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.self_attn = Attention(config)
 
@@ -379,11 +408,15 @@ class MiniMindModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        # Token embedding层
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        # dropout层
         self.dropout = nn.Dropout(config.dropout)
+        # transformer block层
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        # 归一化层
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
+        # 预计算位置编码
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, rope_base=config.rope_theta,
                                                     rope_scaling=config.rope_scaling)
